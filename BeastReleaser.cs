@@ -1,10 +1,11 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using ExileCore;
 using ExileCore.PoEMemory;
-using ExileCore.PoEMemory.Elements;
 using ExileCore.Shared;
 using SharpDX;
 using Vector2 = System.Numerics.Vector2;
@@ -14,7 +15,7 @@ namespace BeastReleaser;
 
 /// <summary>
 /// Releases every captured beast from the Bestiary > Captured Beasts list.
-/// The cursor is parked once on the red X (CapturedBeast.ReleaseButton) of the first card and never
+/// The cursor is parked once on the red X (card child [3]) of the first card and never
 /// moves again: click X -> wait for the confirm popup -> Enter -> wait for the list to shrink -> repeat,
 /// because the next beast always slides into the same slot.
 /// All waiting is frame-by-frame state polling (SyncTask + TaskUtils.NextFrame); the optional fixed
@@ -73,7 +74,7 @@ public class BeastReleaser : BaseSettingsPlugin<BeastReleaserSettings>
 
         var rect = tab.GetClientRect();
         var pos = new Vector2(rect.X, rect.Y - 18);
-        var count = tab.CapturedBeasts?.Count ?? 0;
+        var count = GetBeastCards(tab).Count;
         var text = _task != null
             ? $"BeastReleaser: {_status}  ({_releasedThisRun} released, {count} left)"
             : $"BeastReleaser: idle  [{Settings.ToggleHotkey.Value}] releases {count} beasts";
@@ -90,7 +91,7 @@ public class BeastReleaser : BaseSettingsPlugin<BeastReleaserSettings>
         }
 
         _releasedThisRun = 0;
-        _startCount = tab.CapturedBeasts?.Count ?? 0;
+        _startCount = GetBeastCards(tab).Count;
         _cts = new CancellationTokenSource();
         _status = "starting";
         LogMessage($"BeastReleaser: starting, {_startCount} beasts in list.", 3);
@@ -122,21 +123,89 @@ public class BeastReleaser : BaseSettingsPlugin<BeastReleaserSettings>
         }
     }
 
-    private CapturedBeastsTab GetCapturedBeastsTab()
+    // ExileCore's BestiaryTab.CapturedBeastsTab / CapturedBeastsTab.CapturedBeasts point at stale memory
+    // since the bestiary was regrouped by family, so the tree is walked by child index instead:
+    //   BestiaryTab[18]                captured beasts tab ([0] filter bar, [1] viewport, [2] scrollbar)
+    //     [1]                          viewport (visible list area)
+    //       [0]                        display root, one child per family
+    //         [g][0]                   family header "- Reptiles (1)"
+    //         [g][1][i]                beast card
+    //           [1][0].Text            beast name
+    //           [3]                    red X release button (only visible while hovered)
+    private const int CapturedBeastsTabIndex = 18;
+    private const int CardNameIndex = 1;
+    private const int CardReleaseButtonIndex = 3;
+
+    private Element GetCapturedBeastsTab()
     {
         try
         {
-            var ui = GameController?.IngameState?.IngameUi;
-            var panel = ui?.ChallengesPanel;
+            var panel = GameController?.IngameState?.IngameUi?.ChallengesPanel;
             if (panel == null || !panel.IsVisible) return null;
-            var tab = panel.TabContainer?.BestiaryTab?.CapturedBeastsTab;
-            if (tab == null || !tab.IsVisible) return null;
-            return tab;
+            var bestiary = panel.TabContainer?.BestiaryTab;
+            if (bestiary == null || !bestiary.IsVisible) return null;
+
+            var fixedTab = bestiary.GetChildAtIndex(CapturedBeastsTabIndex);
+            if (LooksLikeCapturedBeastsTab(fixedTab)) return fixedTab;
+
+            // Index moved after a game patch: find it by shape.
+            return bestiary.Children?.FirstOrDefault(LooksLikeCapturedBeastsTab);
         }
         catch
         {
             return null;
         }
+    }
+
+    private static bool LooksLikeCapturedBeastsTab(Element candidate)
+    {
+        try
+        {
+            if (candidate?.IsVisible != true || candidate.ChildCount < 3) return false;
+            var groups = candidate.GetChildAtIndex(1)?.GetChildAtIndex(0);
+            if (groups == null || groups.ChildCount <= 0 || groups.ChildCount > 64) return false;
+            // every family group is a header + a card container
+            return groups.Children.All(g => g?.ChildCount == 2);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static Element GetViewport(Element tab) => tab?.GetChildAtIndex(1);
+
+    /// <summary>All beast cards in display order (family by family, row by row), including ones scrolled out of view.</summary>
+    private static List<Element> GetBeastCards(Element tab)
+    {
+        var result = new List<Element>();
+        try
+        {
+            var groups = GetViewport(tab)?.GetChildAtIndex(0)?.Children;
+            if (groups == null) return result;
+
+            foreach (var group in groups)
+            {
+                if (group?.IsVisible != true) continue;
+                var cards = group.GetChildAtIndex(1)?.Children;
+                if (cards == null) continue;
+                result.AddRange(cards.Where(c => c?.IsVisible == true));
+            }
+        }
+        catch
+        {
+            // UI is changing under us; caller treats a short list as "try again next frame"
+        }
+
+        return result;
+    }
+
+    private static Element GetReleaseButton(Element card) => card?.GetChildAtIndex(CardReleaseButtonIndex);
+
+    private static string GetBeastName(Element card)
+    {
+        try { return card?.GetChildAtIndex(CardNameIndex)?.GetChildAtIndex(0)?.Text; }
+        catch { return null; }
     }
 
     private bool IsPopupVisible()
@@ -152,35 +221,39 @@ public class BeastReleaser : BaseSettingsPlugin<BeastReleaserSettings>
         }
     }
 
-    private int GetBeastCount() => GetCapturedBeastsTab()?.CapturedBeasts?.Count ?? -1;
+    private int GetBeastCount()
+    {
+        var tab = GetCapturedBeastsTab();
+        return tab == null ? -1 : GetBeastCards(tab).Count;
+    }
 
     /// <summary>First beast whose card is fully inside the visible list area (the slot we park on).</summary>
-    private CapturedBeast GetFirstVisibleBeast()
+    private Element GetFirstVisibleBeast()
     {
         var tab = GetCapturedBeastsTab();
         if (tab == null) return null;
 
-        var listRect = tab.GetClientRect();
-        // Shrink a bit so partially scrolled-out cards at the edges are not picked.
-        listRect.Inflate(-4, -4);
-
-        foreach (var beast in tab.CapturedBeasts ?? [])
+        RectangleF listRect;
+        try { listRect = GetViewport(tab)?.GetClientRect() ?? tab.GetClientRect(); }
+        catch { return null; }
+        foreach (var beast in GetBeastCards(tab))
         {
             RectangleF card;
             try { card = beast.GetClientRect(); }
             catch { continue; }
 
             if (card.Width <= 0 || card.Height <= 0) continue;
-            if (!listRect.Contains(card.TopLeft) || !listRect.Contains(card.BottomRight)) continue;
+            // The list only scrolls vertically: skip cards partially scrolled out at the top/bottom edge.
+            if (card.Top < listRect.Top || card.Bottom > listRect.Bottom) continue;
             return beast;
         }
 
         return null;
     }
 
-    private static bool IsReleaseButtonVisible(CapturedBeast beast)
+    private static bool IsReleaseButtonVisible(Element beast)
     {
-        try { return beast?.ReleaseButton?.IsVisible == true; }
+        try { return GetReleaseButton(beast)?.IsVisible == true; }
         catch { return false; }
     }
 
@@ -288,8 +361,7 @@ public class BeastReleaser : BaseSettingsPlugin<BeastReleaserSettings>
                     break;
                 }
 
-                string beastName;
-                try { beastName = target.Name ?? "?"; } catch { beastName = "?"; }
+                var beastName = GetBeastName(target) ?? "?";
 
                 // 1. Make sure the X is showing. On the first beast we hover the card to reveal it and
                 //    park the cursor on the X; afterwards the cursor already sits on the X of whatever
@@ -325,7 +397,7 @@ public class BeastReleaser : BaseSettingsPlugin<BeastReleaserSettings>
 
                 if (parkedPos == null)
                 {
-                    parkedPos = RandomPointIn(target.ReleaseButton.GetClientRect(), 2);
+                    parkedPos = RandomPointIn(GetReleaseButton(target).GetClientRect(), 2);
                     Input.SetCursorPos(parkedPos.Value);
                     await StepDelay(ct);
                     // the X must still be visible with the cursor on it
